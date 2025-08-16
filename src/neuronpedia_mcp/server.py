@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 
-import asyncio
 import os
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
-from mcp.server import Server
-from mcp.server.models import InitializationOptions
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    CallToolRequestParams,
-    ListToolsRequestParams,
-    TextContent,
-    Tool,
-)
+from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel
 
 
@@ -63,53 +54,69 @@ class NeuronpediaClient:
         response.raise_for_status()
         return AttributionGraphResponse(**response.json())
 
-    async def generate_explanation(self, model: str, layer: int, feature: int) -> dict:
-        data = {"model": model, "layer": layer, "feature": feature}
-        response = await self.client.post(f"{self.base_url}/explanations/generate", json=data)
+    async def get_activations(self, model_id: str, layer: int, index: int, text: str) -> dict:
+        data = {"modelId": model_id, "layer": layer, "index": index, "text": text}
+        response = await self.client.post(f"{self.base_url}/activation/new", json=data)
         response.raise_for_status()
         return response.json()
 
-    async def search_explanations(self, query: str, model: Optional[str] = None, layer: Optional[int] = None) -> list:
-        params = {"query": query}
-        if model:
-            params["model"] = model
-        if layer is not None:
-            params["layer"] = layer
-        
-        response = await self.client.get(f"{self.base_url}/explanations/search", params=params)
+    async def get_feature(self, model_id: str, layer: int, index: int) -> dict:
+        response = await self.client.get(f"{self.base_url}/feature/{model_id}/{layer}/{index}")
         response.raise_for_status()
         return response.json()
 
-    async def get_activations(self, model: str, layer: int, feature: int, text: str) -> list:
-        data = {"model": model, "layer": layer, "feature": feature, "text": text}
-        response = await self.client.post(f"{self.base_url}/activations", json=data)
+    async def search_all_features(self, text: str, model_id: str = "gemma-2-2b", topk: int = 10) -> dict:
+        data = {"text": text, "modelId": model_id, "topk": topk}
+        response = await self.client.post(f"{self.base_url}/search-all", json=data)
         response.raise_for_status()
         return response.json()
 
-    async def search_top_features(self, model: str, layer: int, text: str, top_k: int = 10) -> dict:
-        data = {"model": model, "layer": layer, "text": text, "top_k": top_k}
-        response = await self.client.post(f"{self.base_url}/search/top-features", json=data)
+    async def search_topk_by_token(self, text: str, model_id: str = "gemma-2-2b", topk: int = 10) -> dict:
+        data = {"text": text, "modelId": model_id, "topk": topk}
+        response = await self.client.post(f"{self.base_url}/search-topk-by-token", json=data)
         response.raise_for_status()
         return response.json()
 
-    async def steer_generation(
-        self, 
-        model: str, 
-        layer: int, 
-        feature: int, 
-        prompt: str, 
-        steering_strength: float, 
-        is_chat: bool = False
-    ) -> dict:
+    async def generate_explanation(self, model_id: str, layer: int, index: int) -> dict:
+        data = {"modelId": model_id, "layer": layer, "index": index}
+        response = await self.client.post(f"{self.base_url}/explanation/generate", json=data)
+        response.raise_for_status()
+        return response.json()
+
+    async def search_explanations(self, query: str, model_id: Optional[str] = None) -> dict:
+        data = {"query": query}
+        if model_id:
+            data["modelId"] = model_id
+        response = await self.client.post(f"{self.base_url}/explanation/search", json=data)
+        response.raise_for_status()
+        return response.json()
+
+    async def steer_generation(self, text: str, model_id: str, layer: int, index: int, multiplier: float = 1.0) -> dict:
         data = {
-            "model": model,
+            "text": text,
+            "modelId": model_id,
             "layer": layer,
-            "feature": feature,
-            "prompt": prompt,
-            "steering_strength": steering_strength,
-            "is_chat": is_chat,
+            "index": index,
+            "multiplier": multiplier
         }
-        response = await self.client.post(f"{self.base_url}/steering/generate", json=data)
+        response = await self.client.post(f"{self.base_url}/steer", json=data)
+        response.raise_for_status()
+        return response.json()
+
+    async def steer_chat(self, messages: list, model_id: str, layer: int, index: int, multiplier: float = 1.0) -> dict:
+        data = {
+            "messages": messages,
+            "modelId": model_id,
+            "layer": layer,
+            "index": index,
+            "multiplier": multiplier
+        }
+        response = await self.client.post(f"{self.base_url}/steer-chat", json=data)
+        response.raise_for_status()
+        return response.json()
+
+    async def list_graphs(self) -> dict:
+        response = await self.client.get(f"{self.base_url}/graph/list")
         response.raise_for_status()
         return response.json()
 
@@ -117,7 +124,9 @@ class NeuronpediaClient:
         await self.client.aclose()
 
 
-server = Server("neuronpedia-mcp")
+# Initialize FastMCP server
+mcp = FastMCP("neuronpedia-mcp")
+
 neuronpedia_client: Optional[NeuronpediaClient] = None
 
 
@@ -131,189 +140,237 @@ def get_client() -> NeuronpediaClient:
     return neuronpedia_client
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="generate_attribution_graph",
-            description="Generate an attribution graph for analyzing text prompts using Gemma 2-2b",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "prompt": {"type": "string", "description": "Text prompt to analyze"},
-                    "maxLogits": {"type": "number", "description": "Maximum number of logits (optional)"},
-                    "logitProbability": {"type": "number", "description": "Logit probability threshold (optional)"},
-                    "nodeThreshold": {"type": "number", "description": "Node threshold for graph (optional)"},
-                    "edgeThreshold": {"type": "number", "description": "Edge threshold for graph (optional)"},
-                },
-                "required": ["prompt"],
-            },
-        ),
-        Tool(
-            name="generate_explanation",
-            description="Generate an explanation for a specific feature in an AI model",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "description": "Model name (e.g., gpt2-small)"},
-                    "layer": {"type": "number", "description": "Layer number"},
-                    "feature": {"type": "number", "description": "Feature number"},
-                },
-                "required": ["model", "layer", "feature"],
-            },
-        ),
-        Tool(
-            name="search_explanations",
-            description="Search for explanations across models and layers",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "model": {"type": "string", "description": "Optional model filter"},
-                    "layer": {"type": "number", "description": "Optional layer filter"},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="get_activations",
-            description="Get activation values for a specific feature on given text",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "description": "Model name"},
-                    "layer": {"type": "number", "description": "Layer number"},
-                    "feature": {"type": "number", "description": "Feature number"},
-                    "text": {"type": "string", "description": "Input text to analyze"},
-                },
-                "required": ["model", "layer", "feature", "text"],
-            },
-        ),
-        Tool(
-            name="search_top_features",
-            description="Find the top activating features for given text",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "description": "Model name"},
-                    "layer": {"type": "number", "description": "Layer number"},
-                    "text": {"type": "string", "description": "Input text to analyze"},
-                    "topK": {"type": "number", "description": "Number of top features to return (default: 10)"},
-                },
-                "required": ["model", "layer", "text"],
-            },
-        ),
-        Tool(
-            name="steer_generation",
-            description="Steer model generation using a specific feature",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "description": "Model name"},
-                    "layer": {"type": "number", "description": "Layer number"},
-                    "feature": {"type": "number", "description": "Feature number"},
-                    "prompt": {"type": "string", "description": "Generation prompt"},
-                    "steeringStrength": {"type": "number", "description": "Steering strength (-10 to 10)"},
-                    "isChat": {"type": "boolean", "description": "Whether this is a chat model (default: false)"},
-                },
-                "required": ["model", "layer", "feature", "prompt", "steeringStrength"],
-            },
-        ),
-    ]
-
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+@mcp.tool()
+async def generate_attribution_graph(
+    prompt: str,
+    model_id: str = "gemma-2-2b",
+    max_logits: Optional[int] = None,
+    logit_probability: Optional[float] = None,
+    node_threshold: Optional[float] = None,
+    edge_threshold: Optional[float] = None,
+) -> str:
+    """Generate an attribution graph for analyzing text prompts.
+    
+    Args:
+        prompt: Text prompt to analyze
+        model_id: Model to use (default: gemma-2-2b)
+        max_logits: Maximum number of logits (optional)
+        logit_probability: Logit probability threshold (optional)
+        node_threshold: Node threshold for graph (optional)
+        edge_threshold: Edge threshold for graph (optional)
+    """
     try:
         client = get_client()
-        
-        if name == "generate_attribution_graph":
-            result = await client.generate_attribution_graph(
-                prompt=arguments["prompt"],
-                max_logits=arguments.get("maxLogits"),
-                logit_probability=arguments.get("logitProbability"),
-                node_threshold=arguments.get("nodeThreshold"),
-                edge_threshold=arguments.get("edgeThreshold"),
-            )
-            
-            return [TextContent(
-                type="text",
-                text=f"Attribution Graph Generated Successfully!\n\n"
-                     f"🔗 **View Graph**: {result.url}\n"
-                     f"📊 **Nodes**: {result.numNodes}\n"
-                     f"🔗 **Links**: {result.numLinks}\n"
-                     f"💾 **Data**: {result.s3url}\n\n"
-                     f"The graph shows how different parts of the Gemma 2-2b model contribute "
-                     f"to generating each token in your prompt: '{arguments['prompt']}'"
-            )]
-            
-        elif name == "generate_explanation":
-            result = await client.generate_explanation(
-                model=arguments["model"],
-                layer=arguments["layer"],
-                feature=arguments["feature"]
-            )
-            return [TextContent(type="text", text=str(result))]
-            
-        elif name == "search_explanations":
-            result = await client.search_explanations(
-                query=arguments["query"],
-                model=arguments.get("model"),
-                layer=arguments.get("layer")
-            )
-            return [TextContent(type="text", text=str(result))]
-            
-        elif name == "get_activations":
-            result = await client.get_activations(
-                model=arguments["model"],
-                layer=arguments["layer"],
-                feature=arguments["feature"],
-                text=arguments["text"]
-            )
-            return [TextContent(type="text", text=str(result))]
-            
-        elif name == "search_top_features":
-            result = await client.search_top_features(
-                model=arguments["model"],
-                layer=arguments["layer"],
-                text=arguments["text"],
-                top_k=arguments.get("topK", 10)
-            )
-            return [TextContent(type="text", text=str(result))]
-            
-        elif name == "steer_generation":
-            result = await client.steer_generation(
-                model=arguments["model"],
-                layer=arguments["layer"],
-                feature=arguments["feature"],
-                prompt=arguments["prompt"],
-                steering_strength=arguments["steeringStrength"],
-                is_chat=arguments.get("isChat", False)
-            )
-            return [TextContent(type="text", text=str(result))]
-            
-        else:
-            raise ValueError(f"Unknown tool: {name}")
-            
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
-
-
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="neuronpedia-mcp",
-                server_version="1.0.0",
-                capabilities=server.get_capabilities(
-                    notification_options=None,
-                    experimental_capabilities=None,
-                ),
-            ),
+        result = await client.generate_attribution_graph(
+            prompt=prompt,
+            model_id=model_id,
+            max_logits=max_logits,
+            logit_probability=logit_probability,
+            node_threshold=node_threshold,
+            edge_threshold=edge_threshold,
         )
+        
+        return (f"Attribution Graph Generated Successfully!\n\n"
+                f"🔗 **View Graph**: {result.url}\n"
+                f"📊 **Nodes**: {result.numNodes}\n"
+                f"🔗 **Links**: {result.numLinks}\n"
+                f"💾 **Data**: {result.s3url}\n\n"
+                f"The graph shows how different parts of the {model_id} model contribute "
+                f"to generating each token in your prompt: '{prompt}'")
+        
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def get_feature_activations(
+    text: str,
+    model_id: str,
+    layer: int,
+    index: int,
+) -> str:
+    """Get activation values for a specific feature on given text.
+    
+    Args:
+        text: Input text to analyze
+        model_id: Model identifier (e.g., 'gemma-2-2b')
+        layer: Layer number
+        index: Feature index
+    """
+    try:
+        client = get_client()
+        result = await client.get_activations(model_id, layer, index, text)
+        return f"Feature Activations for {model_id} Layer {layer} Feature {index}:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def get_feature_details(
+    model_id: str,
+    layer: int,
+    index: int,
+) -> str:
+    """Get detailed information about a specific feature.
+    
+    Args:
+        model_id: Model identifier (e.g., 'gemma-2-2b')
+        layer: Layer number
+        index: Feature index
+    """
+    try:
+        client = get_client()
+        result = await client.get_feature(model_id, layer, index)
+        return f"Feature Details for {model_id} Layer {layer} Feature {index}:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def search_top_features(
+    text: str,
+    model_id: str = "gemma-2-2b",
+    topk: int = 10,
+) -> str:
+    """Find the top activating features for given text across the entire model.
+    
+    Args:
+        text: Input text to analyze
+        model_id: Model to search (default: gemma-2-2b)
+        topk: Number of top features to return (default: 10)
+    """
+    try:
+        client = get_client()
+        result = await client.search_all_features(text, model_id, topk)
+        return f"Top {topk} Features for '{text}' in {model_id}:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def search_features_by_token(
+    text: str,
+    model_id: str = "gemma-2-2b",
+    topk: int = 10,
+) -> str:
+    """Find top activating features for each token in the text.
+    
+    Args:
+        text: Input text to analyze
+        model_id: Model to search (default: gemma-2-2b)
+        topk: Number of top features per token (default: 10)
+    """
+    try:
+        client = get_client()
+        result = await client.search_topk_by_token(text, model_id, topk)
+        return f"Top Features by Token for '{text}' in {model_id}:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def generate_feature_explanation(
+    model_id: str,
+    layer: int,
+    index: int,
+) -> str:
+    """Generate an explanation for what a specific feature detects.
+    
+    Args:
+        model_id: Model identifier (e.g., 'gemma-2-2b')
+        layer: Layer number
+        index: Feature index
+    """
+    try:
+        client = get_client()
+        result = await client.generate_explanation(model_id, layer, index)
+        return f"Explanation for {model_id} Layer {layer} Feature {index}:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def search_feature_explanations(
+    query: str,
+    model_id: Optional[str] = None,
+) -> str:
+    """Search for feature explanations across models.
+    
+    Args:
+        query: Search query for explanations
+        model_id: Optional model filter
+    """
+    try:
+        client = get_client()
+        result = await client.search_explanations(query, model_id)
+        return f"Feature Explanations for '{query}':\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def steer_text_generation(
+    text: str,
+    model_id: str,
+    layer: int,
+    index: int,
+    multiplier: float = 1.0,
+) -> str:
+    """Steer model text generation using a specific feature.
+    
+    Args:
+        text: Input text to steer
+        model_id: Model identifier
+        layer: Layer number
+        index: Feature index
+        multiplier: Steering strength multiplier (default: 1.0)
+    """
+    try:
+        client = get_client()
+        result = await client.steer_generation(text, model_id, layer, index, multiplier)
+        return f"Steered Generation Result:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def steer_chat_generation(
+    messages: str,
+    model_id: str,
+    layer: int,
+    index: int,
+    multiplier: float = 1.0,
+) -> str:
+    """Steer chat model generation using a specific feature.
+    
+    Args:
+        messages: JSON string of chat messages
+        model_id: Model identifier
+        layer: Layer number
+        index: Feature index
+        multiplier: Steering strength multiplier (default: 1.0)
+    """
+    try:
+        import json
+        client = get_client()
+        messages_list = json.loads(messages)
+        result = await client.steer_chat(messages_list, model_id, layer, index, multiplier)
+        return f"Steered Chat Generation Result:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def list_user_graphs() -> str:
+    """List all attribution graphs created by the user.
+    """
+    try:
+        client = get_client()
+        result = await client.list_graphs()
+        return f"Your Attribution Graphs:\n\n{result}"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    mcp.run()
